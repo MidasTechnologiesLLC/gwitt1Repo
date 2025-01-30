@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HMMs for Market Regime Detection</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        h2 { color: #2c3e50; border-bottom: 2px solid #3498db; }
+        h3 { color: #34495e; }
+        h4 { color: #7f8c8d; }
+        ul { margin: 10px 0; }
+        li { margin: 5px 0; }
+        .example { background: #f8f9fa; padding: 15px; border-left: 4px solid #3498db; margin: 15px 0; }
+        blockquote { color: #666; margin: 10px 0; padding: 10px 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Using Hidden Markov Models (HMMs) to Enhance Algorithmic Trading</h2>
+
+        <!-- Feature Selection Section -->
+        <h3>1. Feature Selection for Regime Detection</h3>
+        <ul>
+            <li><strong>Key Features:</strong> Returns, volatility, trading volume, asset correlations</li>
+            <li><strong>Preprocessing:</strong> Normalize/standardize features</li>
+        </ul>
+
+        <!-- Model Training Section -->
+        <h3>2. Model Training & State Identification</h3>
+        <ul>
+            <li><strong>States:</strong> 3-4 regimes (bull/bear/volatile)</li>
+            <li><strong>Validation:</strong> Use BIC/AIC for state count selection</li>
+        </ul>
+        <div class="example">
+            <strong>Code Example:</strong><br>
+            <code>from hmmlearn import hmm<br>
+            model = hmm.GaussianHMM(n_components=3)</code>
+        </div>
+
+        <!-- Real-Time Inference Section -->
+        <h3>3. Real-Time Regime Probabilities</h3>
+        <ul>
+            <li>Use Viterbi algorithm for state sequence decoding</li>
+            <li>Posterior probabilities for regime confidence</li>
+        </ul>
+        <blockquote>
+            If HMM assigns >80% probability to "high volatility", trigger risk reduction protocols.
+        </blockquote>
+
+        <!-- LSTM Integration Section -->
+        <h3>4. Integration with LSTM Predictions</h3>
+        <h4>Contextual Filtering</h4>
+        <ul>
+            <li>Feed HMM states as features to LSTM</li>
+        </ul>
+        <h4>Model Ensembling</h4>
+        <ul>
+            <li>Train separate LSTMs for different regimes</li>
+        </ul>
+
+        <!-- Dynamic Strategy Section -->
+        <h3>5. Dynamic Strategy Adaptation</h3>
+        <ul>
+            <li>Adjust position sizing based on regime</li>
+            <li>Align trades with regime-LSTM consensus</li>
+        </ul>
+
+        <!-- Backtesting Section -->
+        <h3>6. Regime-Aware Backtesting</h3>
+        <ul>
+            <li>Test strategy performance per regime</li>
+            <li>Optimize parameters for each market state</li>
+        </ul>
+
+        <!-- Advanced Applications -->
+        <h3>7. Advanced Architectures</h3>
+        <ul>
+            <li>AR-HMMs for temporal dependencies</li>
+            <li>Hierarchical HMMs for nested regimes</li>
+        </ul>
+
+        <!-- Implementation Tips -->
+        <div class="example">
+            <h4>Implementation Checklist</h4>
+            <ul>
+                <li>Validate with walk-forward analysis</li>
+                <li>Ensure regime persistence > transaction cost window</li>
+                <li>Use libraries like hmmlearn or pomegranate</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
