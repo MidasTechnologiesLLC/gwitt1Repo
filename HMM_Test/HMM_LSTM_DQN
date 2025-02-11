@@ -1,0 +1,420 @@
+# ===============================
+# 1. INSTALL REQUIRED LIBRARIES
+# ===============================
+!pip install hmmlearn stable-baselines3[extra] joblib optuna optuna-integration[tfkeras]
+
+# ===============================
+# 2. IMPORTS & GLOBALS
+# ===============================
+import os
+import sys
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import logging
+from datetime import datetime
+import pytz
+
+# ---------------------------
+# Force CPU usage:
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+# ---------------------------
+
+from sklearn.preprocessing import MinMaxScaler
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.losses import Huber
+
+from hmmlearn import hmm
+
+import gym
+from gym import spaces
+from stable_baselines3 import DQN
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+import joblib
+import optuna
+from optuna.integration import TFKerasPruningCallback
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+EASTERN = pytz.timezone("US/Eastern")
+
+
+# ===============================
+# 3. DATA LOADING & INDICATORS
+# ===============================
+def load_and_preprocess_data(csv_path):
+    df = pd.read_csv(csv_path)
+    df['Date'] = pd.to_datetime(df['Date'], utc=True)
+    df.set_index('Date', inplace=True)
+    df.index = df.index.tz_convert(EASTERN)
+    df.sort_index(inplace=True)
+
+    df['log_return'] = np.log(df['Close']).diff()
+    df['rolling_vol'] = df['log_return'].rolling(window=30).std()
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100/(1 + rs))
+
+    # Simple MAs
+    df['SMA20'] = df['Close'].rolling(20).mean()
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+
+    # MACD
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+
+    # Bollinger
+    sma20 = df['Close'].rolling(window=20).mean()
+    std20 = df['Close'].rolling(window=20).std()
+    df['BB_upper'] = sma20 + 2.0 * std20
+    df['BB_lower'] = sma20 - 2.0 * std20
+
+    # OBV
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+
+    # Time-of-day
+    df['minute_of_day'] = df.index.hour * 60 + df.index.minute
+    df['tod_sin'] = np.sin(2*np.pi*(df['minute_of_day'] - 570)/(955-570))
+    df['tod_cos'] = np.cos(2*np.pi*(df['minute_of_day'] - 570)/(955-570))
+
+    df.dropna(inplace=True)
+    return df
+
+
+# ===============================
+# 4. ROLLING SLOPE & HMM
+# ===============================
+def add_rolling_slope(df, window=15):
+    closes = df['Close'].values
+    slopes = []
+    for i in range(len(closes)):
+        if i < window:
+            slopes.append(np.nan)
+        else:
+            seg = closes[i-window:i]
+            x_idx = np.arange(window)
+            slope, intercept = np.polyfit(x_idx, seg, 1)
+            slopes.append(slope)
+    df['rolling_slope'] = slopes
+    df.dropna(subset=['rolling_slope'], inplace=True)
+    return df
+
+def train_3state_hmm_on_slope(df):
+    X = df[['rolling_slope']].values.reshape(-1,1)
+    model = hmm.GaussianHMM(n_components=3, covariance_type='diag',
+                            n_iter=1000, random_state=42)
+    model.fit(X)
+    hidden_states = model.predict(X)
+    df['HMM_state'] = hidden_states
+
+    # Sort by slope
+    means = [X[hidden_states==s].mean() for s in range(3)]
+    sort_idx = np.argsort(means)
+    label_map = {}
+    label_map[sort_idx[0]] = 'Bearish'
+    label_map[sort_idx[1]] = 'Sideways'
+    label_map[sort_idx[2]] = 'Bullish'
+    df['HMM_label'] = df['HMM_state'].map(label_map)
+    return model, df
+
+
+# ===============================
+# 5. LSTM DATASET CREATION
+# ===============================
+def create_lstm_sequences(features, target, window_size=15):
+    X_seq, y_seq = [], []
+    for i in range(len(features) - window_size):
+        X_seq.append(features[i:i+window_size])
+        y_seq.append(target[i+window_size])
+    return np.array(X_seq), np.array(y_seq)
+
+
+# ===============================
+# 6. OPTUNA: CPU-FRIENDLY LSTM
+# ===============================
+def build_lstm_model_cpu(n_units1, n_units2, dropout1, dropout2, lr, input_shape):
+    """
+    2-layer LSTM with implementation=1 to ensure non-CuDNN code path.
+    """
+    model = Sequential()
+    # 1st LSTM
+    model.add(LSTM(
+        units=n_units1,
+        return_sequences=True,
+        activation='tanh',
+        recurrent_activation='sigmoid',
+        implementation=1,  # CPU-friendly
+        input_shape=input_shape
+    ))
+    model.add(Dropout(dropout1))
+
+    # 2nd LSTM
+    model.add(LSTM(
+        units=n_units2,
+        activation='tanh',
+        recurrent_activation='sigmoid',
+        implementation=1  # CPU-friendly
+    ))
+    model.add(Dropout(dropout2))
+
+    model.add(Dense(1, activation='linear'))
+    optimizer = Adam(learning_rate=lr)
+    model.compile(optimizer=optimizer, loss=Huber(), metrics=['mae'])
+    return model
+
+def optimize_lstm(trial, X_train, y_train, X_val, y_val, input_shape):
+    # Sample hyperparams
+    n_units1 = trial.suggest_categorical("n_units1", [32, 64, 128])
+    n_units2 = trial.suggest_categorical("n_units2", [16, 32, 64])
+    dropout1 = trial.suggest_float("dropout1", 0.1, 0.5, step=0.1)
+    dropout2 = trial.suggest_float("dropout2", 0.1, 0.5, step=0.1)
+    lr       = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+
+    model = build_lstm_model_cpu(n_units1, n_units2, dropout1, dropout2, lr, input_shape)
+
+    es_cb = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+    history = model.fit(
+        X_train, y_train,
+        epochs=20,
+        batch_size=16,
+        validation_data=(X_val, y_val),
+        callbacks=[es_cb, TFKerasPruningCallback(trial, 'val_loss')],
+        verbose=0
+    )
+    val_loss = min(history.history['val_loss'])
+    return val_loss
+
+def train_lstm_with_optuna(X_train, y_train, X_val, y_val, input_shape, n_trials=5):
+    def objective(trial):
+        return optimize_lstm(trial, X_train, y_train, X_val, y_val, input_shape)
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    best_params = study.best_params
+    logging.info(f"Best Hyperparams from Optuna: {best_params}")
+
+    # Rebuild final model
+    model = build_lstm_model_cpu(
+        best_params['n_units1'],
+        best_params['n_units2'],
+        best_params['dropout1'],
+        best_params['dropout2'],
+        best_params['lr'],
+        input_shape
+    )
+    # Retrain
+    es_cb = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=16,
+        validation_data=(X_val,y_val),
+        callbacks=[es_cb],
+        verbose=1
+    )
+    return model, study
+
+
+# ===============================
+# 7. RL ENVIRONMENT (OPTIONS)
+# ===============================
+class IntradayOptionTradingEnv(gym.Env):
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, df, feature_cols, initial_balance=10000.0):
+        super().__init__()
+        self.df = df.reset_index()  # integer steps
+        self.feature_cols = feature_cols
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.net_worth = initial_balance
+        self.current_step = 0
+        self.max_steps = len(self.df)
+
+        self.option_contracts_held = 0
+        self.cost_basis = 0.0
+
+        self.action_space = spaces.Discrete(3)
+        obs_len = len(feature_cols) + 3
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_len,), dtype=np.float32
+        )
+
+    def reset(self):
+        self.balance = self.initial_balance
+        self.net_worth = self.initial_balance
+        self.current_step = 0
+        self.option_contracts_held = 0
+        self.cost_basis = 0.0
+        return self._next_observation()
+
+    def _next_observation(self):
+        row = self.df.loc[self.current_step]
+        feats = row[self.feature_cols].values.astype(np.float32)
+        bal_ratio = self.balance / self.initial_balance
+        contracts = float(self.option_contracts_held)/10.0
+        cost_ratio = self.cost_basis / self.initial_balance
+        return np.concatenate([feats, [bal_ratio, contracts, cost_ratio]])
+
+    def _get_option_price(self):
+        return self.df.loc[self.current_step, 'Close']
+
+    def _get_hmm_label(self):
+        return self.df.loc[self.current_step, 'HMM_label']
+
+    def step(self, action):
+        price = self._get_option_price()
+        hmm_label = self._get_hmm_label()
+
+        # SELL
+        if action == 0:
+            if self.option_contracts_held > 0:
+                proceeds = self.option_contracts_held * price
+                self.balance += proceeds
+                self.option_contracts_held = 0
+                self.cost_basis = 0.0
+
+        # BUY
+        elif action == 2:
+            if hmm_label != 'Bearish':
+                possible = int(self.balance // price)
+                if possible > 0:
+                    cost = possible*price
+                    self.balance -= cost
+                    prev_held = self.option_contracts_held
+                    self.option_contracts_held += possible
+                    if self.option_contracts_held>0:
+                        self.cost_basis = (
+                            (self.cost_basis*prev_held) + cost
+                        )/self.option_contracts_held
+
+        # 1=Hold -> do nothing
+
+        self.net_worth = self.balance + (self.option_contracts_held * price)
+        self.current_step += 1
+        done = (self.current_step >= self.max_steps-1)
+        reward = self.net_worth - self.initial_balance
+        if done:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        else:
+            obs = self._next_observation()
+        return obs, reward, done, {}
+
+    def render(self, mode='human'):
+        profit = self.net_worth - self.initial_balance
+        print(f"Step {self.current_step}, Bal={self.balance}, Held={self.option_contracts_held}, NW={self.net_worth}, Profit={profit}")
+
+
+def train_dqn_agent(df, feature_cols, timesteps=2000):
+    env = IntradayOptionTradingEnv(df, feature_cols)
+    vec_env = DummyVecEnv([lambda: env])
+    model = DQN(
+        'MlpPolicy',
+        vec_env,
+        verbose=1,
+        learning_rate=1e-3,
+        buffer_size=5000,
+        learning_starts=1000,
+        batch_size=32,
+        gamma=0.99,
+        train_freq=4,
+        target_update_interval=500,
+        exploration_fraction=0.1,
+        exploration_final_eps=0.02,
+        tensorboard_log="./dqn_tensorboard/"
+    )
+    model.learn(total_timesteps=timesteps)
+    model.save("dqn_option_trading_model_cpu")
+    return model
+
+
+# ===============================
+# 8. MAIN
+# ===============================
+def main():
+    csv_path = "/content/drive/MyDrive/Data/GITHUB_5min_RTH_3years.csv"
+
+    df = load_and_preprocess_data(csv_path)
+    logging.info(f"Loaded data: shape={df.shape}")
+
+    # Add slope & HMM
+    df = add_rolling_slope(df, window=15)
+    hmm_model, df = train_3state_hmm_on_slope(df)
+    joblib.dump(hmm_model, "hmm_slope_model.pkl")
+
+    df['HMM_label_num'] = df['HMM_label'].map({'Bearish':0, 'Sideways':1, 'Bullish':2}).astype(float)
+    df.dropna(subset=['RSI','MACD','OBV','rolling_slope','HMM_label_num','Close'], inplace=True)
+
+    # LSTM dataset
+    lstm_feats = ['RSI','MACD','OBV','rolling_slope','HMM_label_num']
+    X_all = df[lstm_feats].values
+    y_all = df[['Close']].values
+
+    scalerX = MinMaxScaler()
+    scalerY = MinMaxScaler()
+    X_scaled = scalerX.fit_transform(X_all)
+    y_scaled = scalerY.fit_transform(y_all).flatten()
+
+    window_size = 15
+    X_seq, y_seq = create_lstm_sequences(X_scaled, y_scaled, window_size)
+    n_total = len(X_seq)
+    train_sz = int(n_total*0.7)
+    val_sz   = int(n_total*0.15)
+
+    X_train = X_seq[:train_sz]
+    y_train = y_seq[:train_sz]
+    X_val = X_seq[train_sz : train_sz+val_sz]
+    y_val = y_seq[train_sz : train_sz+val_sz]
+    X_test = X_seq[train_sz+val_sz:]
+    y_test = y_seq[train_sz+val_sz:]
+
+    logging.info(f"LSTM: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+    input_shape = (X_train.shape[1], X_train.shape[2])
+
+    # Optuna
+    model, study = train_lstm_with_optuna(
+        X_train, y_train,
+        X_val, y_val,
+        input_shape,
+        n_trials=20
+    )
+
+    # Evaluate on test
+    y_pred_scaled = model.predict(X_test).flatten()
+    y_pred = scalerY.inverse_transform(y_pred_scaled.reshape(-1,1)).flatten()
+    y_test_ = scalerY.inverse_transform(y_test.reshape(-1,1)).flatten()
+
+    plt.figure(figsize=(12,5))
+    plt.plot(y_test_, label='Actual')
+    plt.plot(y_pred, label='Predicted')
+    plt.title("CPU-Only LSTM w/ Optuna - Actual vs Predicted")
+    plt.legend()
+    plt.show()
+
+    model.save("optuna_lstm_model_cpu.h5")
+    joblib.dump(scalerX, "lstm_feat_scaler_cpu.gz")
+    joblib.dump(scalerY, "lstm_tgt_scaler_cpu.gz")
+
+    # DQN 
+    dqn_feats = ['RSI','MACD','OBV','rolling_slope','HMM_label_num']
+    dqn_model = train_dqn_agent(df, dqn_feats, timesteps=2000)
+    logging.info("All tasks complete.")
+
+
+if __name__ == "__main__":
+    main()
